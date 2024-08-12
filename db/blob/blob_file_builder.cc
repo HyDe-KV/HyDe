@@ -27,6 +27,7 @@
 #include "test_util/sync_point.h"
 #include "trace_replay/io_tracer.h"
 #include "util/compression.h"
+#include "db/db_dedup.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -104,54 +105,62 @@ Status BlobFileBuilder::Add(const Slice& key, const Slice& value,
     return Status::OK();
   }
 
-  {
-    const Status s = OpenBlobFileIfNeeded();
-    if (!s.ok()) {
-      return s;
-    }
-  }
-
-  Slice blob = value;
-  std::string compressed_blob;
-
-  {
-    const Status s = CompressBlobIfNeeded(&blob, &compressed_blob);
-    if (!s.ok()) {
-      return s;
-    }
-  }
-
   uint64_t blob_file_number = 0;
   uint64_t blob_offset = 0;
+  Slice blob = value;
+  std::string compressed_blob;
+  std::string new_blob;
 
-  {
-    const Status s =
-        WriteBlobToFile(key, blob, &blob_file_number, &blob_offset);
-    if (!s.ok()) {
-      return s;
+  // Slice new_value = DedupMapTable::do_dedup_chunk(value.ToString(), &blob_offset, &blob_file_number);
+  bool dedup_flag = DedupMapTable::do_dedup(value.ToString(), &blob_offset, &blob_file_number);
+
+  if(dedup_flag){
+  // if(!blob.empty()){
+    {
+      const Status s = OpenBlobFileIfNeeded();
+      if (!s.ok()) {
+        return s;
+      }
     }
-  }
-
-  {
-    const Status s = CloseBlobFileIfNeeded();
-    if (!s.ok()) {
-      return s;
+    {
+      const Status s = CompressBlobIfNeeded(&blob, &compressed_blob);
+      if (!s.ok()) {
+        return s;
+      }
     }
-  }
 
-  {
-    const Status s =
-        PutBlobIntoCacheIfNeeded(value, blob_file_number, blob_offset);
-    if (!s.ok()) {
-      ROCKS_LOG_WARN(immutable_options_->info_log,
-                     "Failed to pre-populate the blob into blob cache: %s",
-                     s.ToString().c_str());
+    {
+      const Status s =
+          WriteBlobToFile(key, blob, &blob_file_number, &blob_offset);
+      if (!s.ok()) {
+        return s;
+      }
     }
-  }
 
-  BlobIndex::EncodeBlob(blob_index, blob_file_number, blob_offset, blob.size(),
+    {
+      DedupMapTable::update_offset_chunk(value.ToString(), blob_offset, blob_file_number);
+    }
+
+    {
+      const Status s = CloseBlobFileIfNeeded();
+      if (!s.ok()) {
+        return s;
+      }
+    }
+
+    {
+      const Status s =
+          PutBlobIntoCacheIfNeeded(value, blob_file_number, blob_offset);
+      if (!s.ok()) {
+        ROCKS_LOG_WARN(immutable_options_->info_log,
+                      "Failed to pre-populate the blob into blob cache: %s",
+                      s.ToString().c_str());
+      }
+    }
+  }else {
+    BlobIndex::EncodeBlob(blob_index, blob_file_number, blob_offset, blob.size(),
                         blob_compression_type_);
-
+  }
   return Status::OK();
 }
 
@@ -421,6 +430,259 @@ Status BlobFileBuilder::PutBlobIntoCacheIfNeeded(const Slice& blob,
   }
 
   return s;
+}
+
+//============ Deduplication ======
+DedupMapTable *DedupMapTable::deduptable = nullptr;
+
+DedupMapTable *DedupMapTable::getDedupTable(){
+  if(deduptable == nullptr){
+    deduptable = new DedupMapTable;
+    //mtx = new std::mutex();
+  }
+  return deduptable;
+}
+
+// No chunking
+bool DedupMapTable::do_dedup(std::string value, uint64_t *offset, uint64_t *file_num){
+  bool ret_value = false;
+  if(value.empty())
+    assert(0);
+
+  unsigned char temp_fp[SHA_DIGEST_LENGTH];
+
+  SHA1((const unsigned char *)value.c_str(), value.length(), temp_fp);
+
+  std::string fp = GetHexRepresentation(temp_fp, SHA_DIGEST_LENGTH);  
+  
+  DedupMapTable* dd_tbl = DedupMapTable::getDedupTable();
+  std::shared_lock lock(dd_tbl->mutex_, std::defer_lock);
+  lock.lock();
+  std::unordered_map<std::string, ChunkEntry*>::iterator itr = dd_tbl->DedupTable.find(fp);
+  lock.unlock();
+  if(itr == dd_tbl->DedupTable.end()){ //Unqiue value
+    //unique chunk
+      ChunkEntry *new_chunk = new ChunkEntry();
+      new_chunk->chunk_ref_count = 1;
+      new_chunk->blob_offset = 0;
+      new_chunk->blob_file_number = 0;
+      std::lock_guard update_lock(dd_tbl->mutex_);
+      dd_tbl->DedupTable.emplace(fp, new_chunk);
+      ret_value = true;
+  } else{ //Duplicate value
+    ChunkEntry *tmp_chunk = (*itr).second;
+      tmp_chunk->chunk_ref_count += 1;
+      *offset = tmp_chunk->blob_offset;
+      *file_num = tmp_chunk->blob_file_number;
+      std::lock_guard update_lock(dd_tbl->mutex_);
+      (*itr).second = tmp_chunk;
+  }
+
+  return ret_value;
+}
+
+void DedupMapTable::dedup_chunk(Slice *blob, std::string* new_blob){
+  if(blob->empty())
+    assert(0);
+
+  std::string value = blob->ToString();
+  uint32_t val_size = value.length();
+  uint64_t v_pos = 0;
+  uint64_t chunk_size = 1024 * 64;
+  uint64_t value_size = val_size;
+  while(v_pos < value_size){
+    std::string chunk;
+    if(v_pos > value_size){
+      break;
+    }
+
+    if((v_pos + chunk_size) > value_size){
+      chunk = value.substr(v_pos);
+    } else {
+      chunk = value.substr(v_pos, chunk_size);
+    }
+    v_pos += chunk_size;
+    val_size -= chunk_size;
+    DedupMapTable* dd_tbl = DedupMapTable::getDedupTable();
+    unsigned char temp_fp[SHA_DIGEST_LENGTH];
+
+    SHA1(reinterpret_cast<const unsigned char*>(chunk.c_str()) , chunk.length(), temp_fp);
+
+    std::string fp = DedupMapTable::GetHexRepresentation(temp_fp, SHA_DIGEST_LENGTH);
+
+    std::shared_lock lock(dd_tbl->mutex_, std::defer_lock);
+    lock.lock();
+    std::unordered_map<std::string, ChunkEntry*>::iterator itr = dd_tbl->DedupTable.find(fp);
+    lock.unlock();
+    if(itr == dd_tbl->DedupTable.end()){
+      //unique chunk
+      ChunkEntry *new_chunk = new ChunkEntry();
+      new_chunk->chunk_ref_count = 1;
+      new_chunk->blob_offset = 0;
+      new_chunk->blob_file_number = 0;
+      std::lock_guard update_lock(dd_tbl->mutex_);
+      dd_tbl->DedupTable.emplace(fp, new_chunk);
+      // new_value.append(chunk);
+      new_blob->append(chunk);
+    } else{
+      //Duplicate value
+      // printf("D\n");
+      ChunkEntry *tmp_chunk = (*itr).second;
+      tmp_chunk->chunk_ref_count += 1;
+      std::lock_guard update_lock(dd_tbl->mutex_);
+      (*itr).second = tmp_chunk;
+    }
+  }
+  *blob = Slice(*new_blob);
+}
+
+Slice DedupMapTable::do_dedup_chunk(std::string value, uint64_t* offset, uint64_t* blob_file_number){
+  //First chunk the value and then perform deduplication on that chunk.
+  //Chunking
+  if(value.empty())
+    assert(0);
+
+  std::string new_value;
+  Slice ret_value;
+  uint64_t val_size = value.length();
+  uint64_t v_pos = 0;
+  uint64_t chunk_size = 1024 * 64;
+  uint64_t value_size = val_size;
+  while(v_pos < value_size){
+    std::string chunk;
+    if(v_pos > value_size){
+      break;
+    }
+
+    if((v_pos + chunk_size) > value_size){
+      chunk = value.substr(v_pos);
+    } else {
+      chunk = value.substr(v_pos, chunk_size);
+    }
+    v_pos += chunk_size;
+    val_size -= chunk_size;
+    DedupMapTable* dd_tbl = DedupMapTable::getDedupTable();
+    unsigned char temp_fp[SHA_DIGEST_LENGTH];
+
+    SHA1(reinterpret_cast<const unsigned char*>(chunk.c_str()) , chunk.length(), temp_fp);
+
+    std::string fp = DedupMapTable::GetHexRepresentation(temp_fp, SHA_DIGEST_LENGTH);
+
+    std::shared_lock lock(dd_tbl->mutex_, std::defer_lock);
+    lock.lock();
+    std::unordered_map<std::string, ChunkEntry*>::iterator itr = dd_tbl->DedupTable.find(fp);
+    lock.unlock();
+    if(itr == dd_tbl->DedupTable.end()){
+      //unique chunk
+      ChunkEntry *new_chunk = new ChunkEntry();
+      new_chunk->chunk_ref_count = 1;
+      new_chunk->blob_offset = 0;
+      new_chunk->blob_file_number = 0;
+      std::lock_guard update_lock(dd_tbl->mutex_);
+      dd_tbl->DedupTable.emplace(fp, new_chunk);
+      new_value.append(chunk);
+    } else{
+      //Duplicate value
+      // printf("D\n");
+      ChunkEntry *tmp_chunk = (*itr).second;
+      tmp_chunk->chunk_ref_count += 1;
+      *offset = tmp_chunk->blob_offset;
+      *blob_file_number = tmp_chunk->blob_file_number;
+      std::lock_guard update_lock(dd_tbl->mutex_);
+      (*itr).second = tmp_chunk;
+    }
+  }
+  ret_value = new_value;
+  return ret_value;
+}
+
+std::string DedupMapTable::GetHexRepresentation(const unsigned char *Bytes, size_t Length) {
+  std::string ret;
+  ret.reserve(Length * 2);
+  for(const unsigned char *ptr = Bytes; ptr < Bytes+Length; ++ptr) {
+    char buf[3];
+    sprintf(buf, "%02x", (*ptr)&0xff);
+    ret += buf;
+  }
+  return ret;
+}
+
+/* ====== Update offset without chunking  
+void DedupMapTable::update_offset(std:: string value, void *mem_loc){
+  // printf("DedupMapTable::update_offset\n");
+  unsigned char temp_fp[SHA_DIGEST_LENGTH];
+
+  // SHA1((const unsigned char *)value.c_str(), value.length(), temp_fp);
+  SHA1(reinterpret_cast<const unsigned char*>(value.c_str()), value.length(), temp_fp);
+  std::string fp = GetHexRepresentation(temp_fp, SHA_DIGEST_LENGTH);
+
+  // struct timespec start_put, end_put;
+  // clock_gettime(CLOCK_MONOTONIC, &start_put);
+  
+  DedupMapTable* dd_tbl = DedupMapTable::getDedupTable();
+  std::shared_lock lock(dd_tbl->mutex_, std::defer_lock);
+  lock.lock();
+  std::unordered_map<std::string, ChunkEntry*>::iterator itr = dd_tbl->DedupTable.find(fp);
+  ChunkEntry *temp = (*itr).second;
+  temp->mem_location = mem_loc;
+  lock.unlock();
+  std::lock_guard update_lock(dd_tbl->mutex_);
+  (*itr).second = temp;
+  
+  // clock_gettime(CLOCK_MONOTONIC, &end_put);
+  // long long elapsedTime_put = (end_put.tv_sec - start_put.tv_sec) * 1000000000 + (end_put.tv_nsec - start_put.tv_nsec);
+  // printf("%lld\n", elapsedTime_put/1000);
+  
+}*/
+
+// ======= Update offset with chunking =======
+void DedupMapTable::update_offset_chunk(std::string value, uint64_t offset, uint64_t file_num){
+  if(value.empty())
+    assert(0);
+
+  uint64_t val_size = value.length();
+  uint64_t v_pos = 0;
+  uint64_t chunk_size = val_size;
+  
+  // 131072 bytes => 128 KB | 262144 bytes => 256 KB | 524288 bytes => 512 KB
+  // 1048576 => 1 MB | 2097152 => 2 MB |
+  uint64_t value_size = val_size;
+
+  while(v_pos < value_size){
+    std::string chunk;
+    if(v_pos > value_size){
+      break;
+    }
+
+    if((v_pos + chunk_size) > value_size){
+      chunk = value.substr(v_pos);
+    } else {
+      chunk = value.substr(v_pos, chunk_size);
+    }
+    v_pos += chunk_size;
+    val_size -= chunk_size;
+
+    DedupMapTable* dd_tbl = DedupMapTable::getDedupTable();
+    unsigned char temp_fp[SHA_DIGEST_LENGTH];
+
+    SHA1(reinterpret_cast<const unsigned char*>(chunk.c_str()) , chunk.length(), temp_fp);
+
+    std::string fp = DedupMapTable::GetHexRepresentation(temp_fp, SHA_DIGEST_LENGTH);
+
+    std::shared_lock lock(dd_tbl->mutex_, std::defer_lock);
+    lock.lock();
+    std::unordered_map<std::string, ChunkEntry*>::iterator itr = dd_tbl->DedupTable.find(fp);
+    lock.unlock();
+    if(itr != dd_tbl->DedupTable.end()){
+      ChunkEntry *temp = (*itr).second;
+      temp->blob_offset = offset;
+      temp->blob_file_number = file_num;
+      
+      std::lock_guard update_lock(dd_tbl->mutex_);
+      (*itr).second = temp;
+    }
+
+  }
 }
 
 }  // namespace ROCKSDB_NAMESPACE
